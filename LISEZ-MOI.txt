@@ -1,0 +1,11 @@
+ANISRA — fichiers frontend et serveur
+
+1) index.html : interface ANISRA. Le formulaire de création de compte accepte au minimum 6 caractères.
+2) main.py : API FastAPI. La validation du serveur accepte également 6 à 128 caractères.
+3) requirements.txt : dépendances Python du serveur.
+
+IMPORTANT
+- Remplacez les fichiers correspondants dans les dépôts GitHub.
+- Sur Render, vérifiez la commande de démarrage : uvicorn main:app --host 0.0.0.0 --port $PORT
+- Configurez une variable d'environnement ANISRA_SECRET_KEY avec une clé secrète longue et aléatoire avant d'utiliser des comptes réels.
+- Les messages, invitations et médias n'ont pas tous encore un système temps réel / notifications push. Ce paquet ne prétend pas activer ces fonctions.

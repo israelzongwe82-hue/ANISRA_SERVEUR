@@ -73,7 +73,8 @@ def db():
 class Register(BaseModel):
  username:str=Field(min_length=3,max_length=32,pattern=r"^[a-zA-Z0-9_.-]+$")
  display_name:str=Field(min_length=1,max_length=80)
- password:str=Field(min_length=10,max_length=128)
+ # ANISRA accepte maintenant les mots de passe de 6 à 128 caractères.
+ password:str=Field(min_length=6,max_length=128)
  email:Optional[EmailStr]=None
  phone:Optional[str]=Field(default=None,max_length=32)
 class Login(BaseModel):
