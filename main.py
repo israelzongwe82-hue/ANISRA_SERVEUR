@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import create_engine, String, DateTime, ForeignKey, Text, or_, and_
+from sqlalchemy import create_engine, String, DateTime, ForeignKey, Text, or_, and_, inspect, text as sql_text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, Session
 from passlib.context import CryptContext
 from jose import jwt, JWTError
@@ -33,6 +33,7 @@ class User(Base):
     email:Mapped[Optional[str]]=mapped_column(String(254),unique=True,nullable=True,index=True)
     phone:Mapped[Optional[str]]=mapped_column(String(32),unique=True,nullable=True,index=True)
     password_hash:Mapped[str]=mapped_column(String(255))
+    avatar_data:Mapped[Optional[str]]=mapped_column(Text,nullable=True)
     created_at:Mapped[datetime]=mapped_column(DateTime,default=lambda:datetime.now(timezone.utc))
 class Contact(Base):
     __tablename__='contacts'
@@ -98,13 +99,39 @@ class Presence(Base):
     last_seen:Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow)
     typing_to:Mapped[Optional[str]]=mapped_column(String,nullable=True)
     typing_until:Mapped[Optional[datetime]]=mapped_column(DateTime,nullable=True)
+class MessageReceipt(Base):
+    __tablename__='message_receipts'
+    message_id:Mapped[str]=mapped_column(ForeignKey('messages.id'),primary_key=True)
+    user_id:Mapped[str]=mapped_column(ForeignKey('users.id'),primary_key=True)
+    delivered_at:Mapped[Optional[datetime]]=mapped_column(DateTime,nullable=True)
+    read_at:Mapped[Optional[datetime]]=mapped_column(DateTime,nullable=True)
+class Status(Base):
+    __tablename__='statuses'
+    id:Mapped[str]=mapped_column(String,primary_key=True,default=lambda:str(uuid.uuid4()))
+    user_id:Mapped[str]=mapped_column(ForeignKey('users.id'),index=True)
+    body:Mapped[str]=mapped_column(Text)
+    created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow,index=True)
+    expires_at:Mapped[datetime]=mapped_column(DateTime,index=True)
+class ProfileUpdate(BaseModel):
+    display_name:Optional[str]=Field(default=None,min_length=1,max_length=80)
+    avatar_data:Optional[str]=Field(default=None,max_length=500000)
+class StatusIn(BaseModel):
+    body:str=Field(min_length=1,max_length=1000)
+    duration_hours:int=Field(default=24,ge=1,le=24)
 class TypingIn(BaseModel):
     is_typing:bool=False
 Base.metadata.create_all(engine)
+# Migration légère pour les bases existantes.
+try:
+    if 'avatar_data' not in {c['name'] for c in inspect(engine).get_columns('users')}:
+        with engine.begin() as conn:
+            conn.execute(sql_text('ALTER TABLE users ADD COLUMN avatar_data TEXT'))
+except Exception as migration_error:
+    print('Migration avatar_data:', migration_error)
 
-def view(u): return {'id':u.id,'username':u.username,'display_name':u.display_name,'email':u.email,'phone':u.phone}
+def view(u): return {'id':u.id,'username':u.username,'display_name':u.display_name,'email':u.email,'phone':u.phone,'avatar_data':getattr(u,'avatar_data',None)}
 def make_token(u):
-    n=datetime.now(timezone.utc); return jwt.encode({'sub':u.id,'iat':n,'exp':n+timedelta(days=7)},SECRET,algorithm='HS256')
+    n=datetime.now(timezone.utc); return jwt.encode({'sub':u.id,'iat':n,'exp':n+timedelta(days=30)},SECRET,algorithm='HS256')
 def auth(token:str=Depends(oauth),s:Session=Depends(db)):
     try: uid=jwt.decode(token,SECRET,algorithms=['HS256']).get('sub')
     except JWTError: raise HTTPException(401,'Session invalide ou expirée.')
@@ -112,7 +139,12 @@ def auth(token:str=Depends(oauth),s:Session=Depends(db)):
     if not u: raise HTTPException(401,'Compte introuvable.')
     return u
 def is_contact(s,a,b): return bool(s.query(Contact).filter_by(owner_id=a,contact_id=b).first())
-def message_view(m): return {'id':m.id,'sender_id':m.sender_id,'receiver_id':m.receiver_id,'body':m.body,'created_at':m.created_at.isoformat()}
+def message_view(m,s=None,viewer=None):
+    out={'id':m.id,'sender_id':m.sender_id,'receiver_id':m.receiver_id,'body':m.body,'created_at':m.created_at.isoformat(),'delivered':False,'read':False}
+    if s is not None and viewer is not None and m.sender_id==viewer:
+        r=s.get(MessageReceipt,(m.id,m.receiver_id))
+        out['delivered']=bool(r and r.delivered_at);out['read']=bool(r and r.read_at)
+    return out
 def normalize_phone(q): return re.sub(r'[^0-9+]','',q or '')
 
 @app.get('/')
@@ -136,6 +168,13 @@ def login(d:Login,s:Session=Depends(db)):
     return {'access_token':make_token(u),'token_type':'bearer','user':view(u)}
 @app.get('/me')
 def me(u:User=Depends(auth)): return view(u)
+@app.put('/me/profile')
+def update_profile(d:ProfileUpdate,s:Session=Depends(db),u:User=Depends(auth)):
+    if d.display_name is not None: u.display_name=d.display_name.strip()
+    if d.avatar_data is not None:
+        if d.avatar_data and not d.avatar_data.startswith('data:image/'): raise HTTPException(400,'Photo invalide.')
+        u.avatar_data=d.avatar_data or None
+    s.commit();s.refresh(u);return view(u)
 @app.get('/users/search')
 def search(q:str=Query(...,min_length=2),s:Session=Depends(db),u:User=Depends(auth)):
     q=q.strip(); digits=normalize_phone(q)
@@ -243,19 +282,48 @@ def history(other_id:str,s:Session=Depends(db),u:User=Depends(auth),since:str|No
     if since:
         try:q=q.filter(Message.created_at>datetime.fromisoformat(since.replace('Z','+00:00')).replace(tzinfo=None))
         except ValueError: raise HTTPException(400,'Date de synchronisation invalide.')
-    return [message_view(m) for m in q.order_by(Message.created_at.asc()).limit(500).all()]
+    return [message_view(m,s,u.id) for m in q.order_by(Message.created_at.asc()).limit(500).all()]
+@app.post('/messages/{other_id}/receipt')
+def mark_messages_received(other_id:str,state:dict,s:Session=Depends(db),u:User=Depends(auth)):
+    level=state.get('state','delivered')
+    if level not in ('delivered','read'): raise HTTPException(400,'État de réception invalide.')
+    now=datetime.utcnow()
+    rows=s.query(Message).filter(Message.sender_id==other_id,Message.receiver_id==u.id).all()
+    for m in rows:
+        r=s.get(MessageReceipt,(m.id,u.id))
+        if not r: r=MessageReceipt(message_id=m.id,user_id=u.id);s.add(r)
+        if not r.delivered_at:r.delivered_at=now
+        if level=='read':r.read_at=now
+    s.commit();return {'ok':True,'count':len(rows),'state':level}
+
 @app.delete('/messages/{message_id}')
 def delete_message(message_id:str,s:Session=Depends(db),u:User=Depends(auth)):
     m=s.get(Message,message_id)
     if not m or m.sender_id!=u.id: raise HTTPException(404,'Message introuvable ou non supprimable.')
-    s.delete(m);s.commit();return {'ok':True}
+    s.query(MessageReceipt).filter_by(message_id=m.id).delete();s.delete(m);s.commit();return {'ok':True}
 @app.delete('/messages/conversation/{other_id}')
 def clear_conversation(other_id:str,s:Session=Depends(db),u:User=Depends(auth)):
     rows=s.query(Message).filter(or_(and_(Message.sender_id==u.id,Message.receiver_id==other_id),and_(Message.sender_id==other_id,Message.receiver_id==u.id))).all()
     # Suppression pour cet utilisateur uniquement : on ne retire que ses messages envoyés.
     own=[m for m in rows if m.sender_id==u.id]
-    for m in own:s.delete(m)
+    for m in own:
+        s.query(MessageReceipt).filter_by(message_id=m.id).delete();s.delete(m)
     s.commit();return {'ok':True,'deleted':len(own)}
+@app.get('/statuses')
+def list_statuses(s:Session=Depends(db),u:User=Depends(auth)):
+    now=datetime.utcnow()
+    s.query(Status).filter(Status.expires_at<=now).delete(synchronize_session=False);s.commit()
+    return [{'id':x.id,'user_id':x.user_id,'body':x.body,'created_at':x.created_at.isoformat(),'expires_at':x.expires_at.isoformat(),'user':view(s.get(User,x.user_id))} for x in s.query(Status).order_by(Status.created_at.desc()).limit(300).all()]
+@app.post('/statuses')
+def create_status(d:StatusIn,s:Session=Depends(db),u:User=Depends(auth)):
+    now=datetime.utcnow();x=Status(user_id=u.id,body=d.body,created_at=now,expires_at=now+timedelta(hours=d.duration_hours));s.add(x);s.commit();s.refresh(x)
+    return {'id':x.id,'user_id':u.id,'body':x.body,'created_at':x.created_at.isoformat(),'expires_at':x.expires_at.isoformat(),'user':view(u)}
+@app.delete('/statuses/{sid}')
+def delete_status(sid:str,s:Session=Depends(db),u:User=Depends(auth)):
+    x=s.get(Status,sid)
+    if not x or x.user_id!=u.id: raise HTTPException(404,'Statut introuvable.')
+    s.delete(x);s.commit();return {'ok':True}
+
 @app.post('/calls')
 def create_call(d:CallIn,s:Session=Depends(db),u:User=Depends(auth)):
     if not is_contact(s,u.id,d.receiver_id): raise HTTPException(403,'Vous devez être contacts.')
@@ -272,6 +340,9 @@ def clear_calls(s:Session=Depends(db),u:User=Depends(auth)):
     s.commit();return {'ok':True,'deleted':len(rows)}
 @app.post('/files')
 async def upload(file:UploadFile=File(...),u:User=Depends(auth)):
+    allowed={'.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.txt','.csv','.rtf','.odt','.ods','.odp'}
+    original=pathlib.Path(file.filename or 'document').name
+    if pathlib.Path(original).suffix.lower() not in allowed: raise HTTPException(415,'ANISRA accepte uniquement les documents (PDF, Word, Excel, PowerPoint, texte).')
     data=await file.read(15*1024*1024+1)
     if len(data)>15*1024*1024: raise HTTPException(413,'Limite de 15 Mo.')
     name=uuid.uuid4().hex+'_'+pathlib.Path(file.filename or 'fichier').name
@@ -285,6 +356,25 @@ def download_file(name:str,u:User=Depends(auth)):
 @app.post('/groups')
 def create_group(d:GroupIn,s:Session=Depends(db),u:User=Depends(auth)):
     g=Group(name=d.name,owner_id=u.id);s.add(g);s.flush();s.add(GroupMember(group_id=g.id,user_id=u.id));s.commit();s.refresh(g);return {'id':g.id,'name':g.name,'owner_id':u.id}
+@app.get('/groups')
+def list_groups(s:Session=Depends(db),u:User=Depends(auth)):
+    ids=[x.group_id for x in s.query(GroupMember).filter_by(user_id=u.id).all()]
+    return [{'id':g.id,'name':g.name,'owner_id':g.owner_id} for g in s.query(Group).filter(Group.id.in_(ids)).all()]
+@app.delete('/groups/{gid}/members/me')
+def leave_group(gid:str,s:Session=Depends(db),u:User=Depends(auth)):
+    row=s.query(GroupMember).filter_by(group_id=gid,user_id=u.id).first()
+    if not row: raise HTTPException(404,'Vous ne faites pas partie de ce groupe.')
+    s.delete(row)
+    if s.query(GroupMember).filter_by(group_id=gid).count()==0:
+        g=s.get(Group,gid)
+        if g:s.delete(g)
+    s.commit();return {'ok':True}
+@app.delete('/groups/{gid}')
+def delete_group(gid:str,s:Session=Depends(db),u:User=Depends(auth)):
+    g=s.get(Group,gid)
+    if not g or g.owner_id!=u.id: raise HTTPException(403,'Seul le créateur peut supprimer ce groupe.')
+    s.query(GroupMember).filter_by(group_id=gid).delete();s.query(GroupMessage).filter_by(group_id=gid).delete();s.delete(g);s.commit();return {'ok':True}
+
 @app.post('/groups/{gid}/members/{uid}')
 def add_member(gid:str,uid:str,s:Session=Depends(db),u:User=Depends(auth)):
     g=s.get(Group,gid)
