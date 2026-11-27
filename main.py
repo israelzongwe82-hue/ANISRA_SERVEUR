@@ -425,11 +425,13 @@ async def upload(file:UploadFile=File(...),receiver_id:Optional[str]=None,group_
         group=s.get(Group,group_id)
         if not group or not s.query(GroupMember).filter_by(group_id=group_id,user_id=u.id).first(): raise HTTPException(403,'Vous ne faites pas partie de ce groupe.')
     image_ext={'.jpg','.jpeg','.png','.webp','.gif','.bmp'}
+    audio_ext={'.mp3','.m4a','.aac','.ogg','.opus','.wav','.webm'}
     limit=10*1024*1024 if ext in image_ext else 20*1024*1024
     data=await file.read(limit+1)
     if len(data)>limit: raise HTTPException(413,'Limite : 10 Mo pour une image et 20 Mo pour les autres fichiers.')
     mime=(file.content_type or mimetypes.guess_type(original)[0] or 'application/octet-stream')[:160]
     if ext in image_ext and not mime.startswith('image/'): raise HTTPException(415,'Le fichier image semble invalide.')
+    if ext in audio_ext and not mime.startswith('audio/') and not (ext=='.webm' and mime=='video/webm'): raise HTTPException(415,'Le fichier audio semble invalide.')
     file_id=uuid.uuid4().hex
     stored_name=file_id
     (UPLOAD_DIR/stored_name).write_bytes(data)
