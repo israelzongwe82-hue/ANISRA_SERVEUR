@@ -381,11 +381,15 @@ def clear_calls(s:Session=Depends(db),u:User=Depends(auth)):
     s.commit();return {'ok':True,'deleted':len(rows)}
 @app.post('/files')
 async def upload(file:UploadFile=File(...),u:User=Depends(auth)):
-    allowed={'.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.txt','.csv','.rtf','.odt','.ods','.odp'}
+    document_ext={'.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.txt','.csv','.rtf','.odt','.ods','.odp'}
+    image_ext={'.jpg','.jpeg','.png','.webp','.gif'}
     original=pathlib.Path(file.filename or 'document').name
-    if pathlib.Path(original).suffix.lower() not in allowed: raise HTTPException(415,'ANISRA accepte uniquement les documents (PDF, Word, Excel, PowerPoint, texte).')
-    data=await file.read(15*1024*1024+1)
-    if len(data)>15*1024*1024: raise HTTPException(413,'Limite de 15 Mo.')
+    ext=pathlib.Path(original).suffix.lower()
+    if ext not in document_ext|image_ext: raise HTTPException(415,'ANISRA accepte les photos JPG, PNG, WEBP, GIF et les documents PDF, Word, Excel, PowerPoint ou texte.')
+    limit=8*1024*1024 if ext in image_ext else 15*1024*1024
+    data=await file.read(limit+1)
+    if len(data)>limit: raise HTTPException(413,'Limite de 8 Mo pour une photo et 15 Mo pour un document.')
+    if ext in image_ext and not (file.content_type or '').startswith('image/'): raise HTTPException(415,'Le fichier photo doit être une image valide.')
     name=uuid.uuid4().hex+'_'+pathlib.Path(file.filename or 'fichier').name
     (UPLOAD_DIR/name).write_bytes(data)
     return {'stored':True,'file_id':name,'filename':file.filename,'size':len(data),'url':'files/'+name}
