@@ -116,6 +116,12 @@ class Status(Base):
     media_data:Mapped[Optional[str]]=mapped_column(Text,nullable=True)
     created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow,index=True)
     expires_at:Mapped[datetime]=mapped_column(DateTime,index=True)
+class StatusLike(Base):
+    __tablename__='status_likes'
+    status_id:Mapped[str]=mapped_column(ForeignKey('statuses.id',ondelete='CASCADE'),primary_key=True)
+    user_id:Mapped[str]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),primary_key=True)
+    created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow)
+
 class ProfileUpdate(BaseModel):
     display_name:Optional[str]=Field(default=None,min_length=1,max_length=80)
     avatar_data:Optional[str]=Field(default=None,max_length=500000)
@@ -330,13 +336,29 @@ def clear_conversation(other_id:str,s:Session=Depends(db),u:User=Depends(auth)):
 def list_statuses(s:Session=Depends(db),u:User=Depends(auth)):
     now=datetime.utcnow()
     s.query(Status).filter(Status.expires_at<=now).delete(synchronize_session=False);s.commit()
-    return [{'id':x.id,'user_id':x.user_id,'body':x.body,'media_data':x.media_data,'created_at':x.created_at.isoformat(),'expires_at':x.expires_at.isoformat(),'user':view(s.get(User,x.user_id))} for x in s.query(Status).order_by(Status.created_at.desc()).limit(300).all()]
+    rows=s.query(Status).order_by(Status.created_at.desc()).limit(300).all()
+    result=[]
+    for x in rows:
+        likes=s.query(StatusLike).filter_by(status_id=x.id).count()
+        liked=s.get(StatusLike,(x.id,u.id)) is not None
+        result.append({'id':x.id,'user_id':x.user_id,'body':x.body,'media_data':x.media_data,'created_at':x.created_at.isoformat(),'expires_at':x.expires_at.isoformat(),'user':view(s.get(User,x.user_id)),'likes_count':likes,'liked_by_me':liked})
+    return result
 @app.post('/statuses')
 def create_status(d:StatusIn,s:Session=Depends(db),u:User=Depends(auth)):
     if not d.body.strip() and not d.media_data: raise HTTPException(400,'Ajoutez un texte ou une photo.')
     if d.media_data and not d.media_data.startswith('data:image/'): raise HTTPException(400,'Photo de statut invalide.')
     now=datetime.utcnow();x=Status(user_id=u.id,body=d.body,media_data=d.media_data,created_at=now,expires_at=now+timedelta(hours=d.duration_hours));s.add(x);s.commit();s.refresh(x)
     return {'id':x.id,'user_id':u.id,'body':x.body,'media_data':x.media_data,'created_at':x.created_at.isoformat(),'expires_at':x.expires_at.isoformat(),'user':view(u)}
+@app.post('/statuses/{sid}/like')
+def toggle_status_like(sid:str,s:Session=Depends(db),u:User=Depends(auth)):
+    x=s.get(Status,sid)
+    if not x or x.expires_at<=datetime.utcnow(): raise HTTPException(404,'Statut introuvable ou expiré.')
+    existing=s.get(StatusLike,(sid,u.id))
+    if existing: s.delete(existing); liked=False
+    else: s.add(StatusLike(status_id=sid,user_id=u.id)); liked=True
+    s.commit()
+    return {'liked':liked,'likes_count':s.query(StatusLike).filter_by(status_id=sid).count()}
+
 @app.delete('/statuses/{sid}')
 def delete_status(sid:str,s:Session=Depends(db),u:User=Depends(auth)):
     x=s.get(Status,sid)
