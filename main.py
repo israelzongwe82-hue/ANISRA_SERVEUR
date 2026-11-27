@@ -122,6 +122,17 @@ class StatusLike(Base):
     user_id:Mapped[str]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),primary_key=True)
     created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow)
 
+class FileAsset(Base):
+    __tablename__='file_assets'
+    id:Mapped[str]=mapped_column(String,primary_key=True)
+    owner_id:Mapped[str]=mapped_column(ForeignKey('users.id'),index=True)
+    receiver_id:Mapped[Optional[str]]=mapped_column(ForeignKey('users.id'),nullable=True,index=True)
+    group_id:Mapped[Optional[str]]=mapped_column(ForeignKey('groups.id'),nullable=True,index=True)
+    original_name:Mapped[str]=mapped_column(String(255))
+    mime_type:Mapped[str]=mapped_column(String(160),default='application/octet-stream')
+    size:Mapped[int]=mapped_column(default=0)
+    created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow)
+
 class ProfileUpdate(BaseModel):
     display_name:Optional[str]=Field(default=None,min_length=1,max_length=80)
     avatar_data:Optional[str]=Field(default=None,max_length=500000)
@@ -146,6 +157,24 @@ try:
             conn.execute(sql_text('ALTER TABLE groups ADD COLUMN description TEXT'))
 except Exception as migration_error:
     print('Migration avatar_data:', migration_error)
+
+# Rattacher les anciennes pièces jointes déjà référencées dans les messages.
+try:
+    with SessionLocal() as migration_session:
+        legacy_rows=[]
+        legacy_rows.extend((m.sender_id,m.receiver_id,None,m.body) for m in migration_session.query(Message).all())
+        legacy_rows.extend((m.sender_id,None,m.group_id,m.body) for m in migration_session.query(GroupMessage).all())
+        for owner_id,receiver_id,group_id,body in legacy_rows:
+            for stored in re.findall(r'files/([a-f0-9]{32}_[^\\s\"\']+)', body or ''):
+                if migration_session.get(FileAsset,stored): continue
+                legacy_path=UPLOAD_DIR/stored
+                if not legacy_path.is_file(): continue
+                original=stored.split('_',1)[-1][:255] or 'fichier'
+                mime=mimetypes.guess_type(original)[0] or 'application/octet-stream'
+                migration_session.add(FileAsset(id=stored,owner_id=owner_id,receiver_id=receiver_id,group_id=group_id,original_name=original,mime_type=mime,size=legacy_path.stat().st_size))
+        migration_session.commit()
+except Exception as legacy_error:
+    print('Migration anciennes pièces jointes:', legacy_error)
 
 def view(u): return {'id':u.id,'username':u.username,'display_name':u.display_name,'email':u.email,'phone':u.phone,'avatar_data':getattr(u,'avatar_data',None)}
 def make_token(u):
@@ -380,24 +409,45 @@ def clear_calls(s:Session=Depends(db),u:User=Depends(auth)):
     for c in rows:s.delete(c)
     s.commit();return {'ok':True,'deleted':len(rows)}
 @app.post('/files')
-async def upload(file:UploadFile=File(...),u:User=Depends(auth)):
-    document_ext={'.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.txt','.csv','.rtf','.odt','.ods','.odp'}
-    image_ext={'.jpg','.jpeg','.png','.webp','.gif'}
-    original=pathlib.Path(file.filename or 'document').name
+async def upload(file:UploadFile=File(...),receiver_id:Optional[str]=None,group_id:Optional[str]=None,s:Session=Depends(db),u:User=Depends(auth)):
+    # Transfert de pièces jointes : le serveur ne les exécute jamais.
+    blocked={'.exe','.dll','.bat','.cmd','.com','.msi','.ps1','.sh','.jar','.scr','.vbs'}
+    original=pathlib.Path(file.filename or 'fichier').name.replace(chr(0),'')[:255] or 'fichier'
     ext=pathlib.Path(original).suffix.lower()
-    if ext not in document_ext|image_ext: raise HTTPException(415,'ANISRA accepte les photos JPG, PNG, WEBP, GIF et les documents PDF, Word, Excel, PowerPoint ou texte.')
-    limit=8*1024*1024 if ext in image_ext else 15*1024*1024
+    if ext in blocked: raise HTTPException(415,'Ce type de fichier exécutable n’est pas accepté.')
+    if bool(receiver_id)==bool(group_id): raise HTTPException(400,'Indiquez un destinataire ou un groupe.')
+    if receiver_id:
+        peer=s.get(User,receiver_id)
+        if not peer or peer.id==u.id: raise HTTPException(404,'Destinataire introuvable.')
+        has_conversation=s.query(Message).filter(or_(and_(Message.sender_id==u.id,Message.receiver_id==receiver_id),and_(Message.sender_id==receiver_id,Message.receiver_id==u.id))).first()
+        if not is_contact(s,u.id,receiver_id) and not has_conversation: raise HTTPException(403,'Vous ne pouvez pas envoyer un fichier à ce compte.')
+    else:
+        group=s.get(Group,group_id)
+        if not group or not s.query(GroupMember).filter_by(group_id=group_id,user_id=u.id).first(): raise HTTPException(403,'Vous ne faites pas partie de ce groupe.')
+    image_ext={'.jpg','.jpeg','.png','.webp','.gif','.bmp'}
+    limit=10*1024*1024 if ext in image_ext else 20*1024*1024
     data=await file.read(limit+1)
-    if len(data)>limit: raise HTTPException(413,'Limite de 8 Mo pour une photo et 15 Mo pour un document.')
-    if ext in image_ext and not (file.content_type or '').startswith('image/'): raise HTTPException(415,'Le fichier photo doit être une image valide.')
-    name=uuid.uuid4().hex+'_'+pathlib.Path(file.filename or 'fichier').name
-    (UPLOAD_DIR/name).write_bytes(data)
-    return {'stored':True,'file_id':name,'filename':file.filename,'size':len(data),'url':'files/'+name}
+    if len(data)>limit: raise HTTPException(413,'Limite : 10 Mo pour une image et 20 Mo pour les autres fichiers.')
+    mime=(file.content_type or mimetypes.guess_type(original)[0] or 'application/octet-stream')[:160]
+    if ext in image_ext and not mime.startswith('image/'): raise HTTPException(415,'Le fichier image semble invalide.')
+    file_id=uuid.uuid4().hex
+    stored_name=file_id
+    (UPLOAD_DIR/stored_name).write_bytes(data)
+    asset=FileAsset(id=file_id,owner_id=u.id,receiver_id=receiver_id,group_id=group_id,original_name=original,mime_type=mime,size=len(data))
+    s.add(asset);s.commit()
+    return {'stored':True,'file_id':file_id,'filename':original,'size':len(data),'mime_type':mime,'url':'files/'+file_id}
 @app.get('/files/{name}')
-def download_file(name:str,u:User=Depends(auth)):
-    path=(UPLOAD_DIR/name).resolve()
-    if path.parent!=UPLOAD_DIR.resolve() or not path.is_file(): raise HTTPException(404,'Fichier introuvable.')
-    return FileResponse(path,filename=name.split('_',1)[-1],media_type=mimetypes.guess_type(name)[0] or 'application/octet-stream')
+def download_file(name:str,inline:bool=False,s:Session=Depends(db),u:User=Depends(auth)):
+    asset=s.get(FileAsset,name)
+    if not asset: raise HTTPException(404,'Fichier introuvable.')
+    allowed=asset.owner_id==u.id or asset.receiver_id==u.id
+    if asset.group_id:
+        allowed=allowed or bool(s.query(GroupMember).filter_by(group_id=asset.group_id,user_id=u.id).first())
+    if not allowed: raise HTTPException(403,'Vous ne pouvez pas accéder à ce fichier.')
+    path=(UPLOAD_DIR/asset.id).resolve()
+    if path.parent!=UPLOAD_DIR.resolve() or not path.is_file(): raise HTTPException(404,'Fichier introuvable sur le serveur.')
+    disposition='inline' if inline and asset.mime_type in ('image/jpeg','image/png','image/webp','image/gif','image/bmp') else 'attachment'
+    return FileResponse(path,filename=asset.original_name,media_type=asset.mime_type,content_disposition_type=disposition)
 @app.post('/groups')
 def create_group(d:GroupIn,s:Session=Depends(db),u:User=Depends(auth)):
     g=Group(name=d.name,description=d.description,owner_id=u.id);s.add(g);s.flush();s.add(GroupMember(group_id=g.id,user_id=u.id));s.commit();s.refresh(g);return {'id':g.id,'name':g.name,'description':g.description,'owner_id':u.id}
