@@ -92,6 +92,14 @@ class GroupMessage(Base):
     id:Mapped[str]=mapped_column(String,primary_key=True,default=lambda:str(uuid.uuid4()))
     group_id:Mapped[str]=mapped_column(ForeignKey('groups.id'),index=True); sender_id:Mapped[str]=mapped_column(ForeignKey('users.id'),index=True)
     body:Mapped[str]=mapped_column(Text); created_at:Mapped[datetime]=mapped_column(DateTime,default=lambda:datetime.now(timezone.utc))
+class Presence(Base):
+    __tablename__='presence'
+    user_id:Mapped[str]=mapped_column(ForeignKey('users.id'),primary_key=True)
+    last_seen:Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow)
+    typing_to:Mapped[Optional[str]]=mapped_column(String,nullable=True)
+    typing_until:Mapped[Optional[datetime]]=mapped_column(DateTime,nullable=True)
+class TypingIn(BaseModel):
+    is_typing:bool=False
 Base.metadata.create_all(engine)
 
 def view(u): return {'id':u.id,'username':u.username,'display_name':u.display_name,'email':u.email,'phone':u.phone}
@@ -152,10 +160,68 @@ def answer_invite(iid:str,action:str,s:Session=Depends(db),u:User=Depends(auth))
         for a,b in ((x.sender_id,x.receiver_id),(x.receiver_id,x.sender_id)):
             if not is_contact(s,a,b): s.add(Contact(owner_id=a,contact_id=b))
     s.commit();return {'status':x.status}
+@app.post('/contacts/{contact_id}')
+def add_contact(contact_id:str,s:Session=Depends(db),u:User=Depends(auth)):
+    other=s.get(User,contact_id)
+    if not other or other.id==u.id: raise HTTPException(404,'Compte ANISRA introuvable.')
+    if not is_contact(s,u.id,other.id):
+        s.add(Contact(owner_id=u.id,contact_id=other.id));s.commit()
+    return {'ok':True,'contact':view(other)}
+
 @app.get('/contacts')
 def contacts(s:Session=Depends(db),u:User=Depends(auth)):
     ids=[x.contact_id for x in s.query(Contact).filter_by(owner_id=u.id).all()]
     return [view(s.get(User,i)) for i in ids if s.get(User,i)]
+@app.get('/conversations')
+def conversations(s:Session=Depends(db),u:User=Depends(auth)):
+    peer_ids=set(x.contact_id for x in s.query(Contact).filter_by(owner_id=u.id).all())
+    rows=s.query(Message.sender_id,Message.receiver_id).filter(or_(Message.sender_id==u.id,Message.receiver_id==u.id)).all()
+    for sender,receiver in rows:
+        peer_ids.add(receiver if sender==u.id else sender)
+    result=[]
+    for peer_id in peer_ids:
+        peer=s.get(User,peer_id)
+        if not peer: continue
+        last=s.query(Message).filter(or_(and_(Message.sender_id==u.id,Message.receiver_id==peer_id),and_(Message.sender_id==peer_id,Message.receiver_id==u.id))).order_by(Message.created_at.desc()).first()
+        result.append({'user':view(peer),'last_message':message_view(last) if last else None})
+    result.sort(key=lambda x:(x['last_message'] or {}).get('created_at',''),reverse=True)
+    return result
+
+@app.post('/presence/heartbeat')
+def presence_heartbeat(s:Session=Depends(db),u:User=Depends(auth)):
+    row=s.get(Presence,u.id)
+    if not row:
+        row=Presence(user_id=u.id,last_seen=datetime.utcnow());s.add(row)
+    else:
+        row.last_seen=datetime.utcnow()
+    s.commit()
+    return {'ok':True,'last_seen':row.last_seen.isoformat()}
+
+@app.get('/presence/{other_id}')
+def get_presence(other_id:str,s:Session=Depends(db),u:User=Depends(auth)):
+    other=s.get(User,other_id)
+    if not other: raise HTTPException(404,'Utilisateur introuvable.')
+    allowed=is_contact(s,u.id,other_id) or s.query(Message).filter(or_(and_(Message.sender_id==u.id,Message.receiver_id==other_id),and_(Message.sender_id==other_id,Message.receiver_id==u.id))).first() is not None
+    if not allowed: raise HTTPException(403,'Présence non disponible pour ce compte.')
+    row=s.get(Presence,other_id)
+    now=datetime.utcnow()
+    online=bool(row and row.last_seen and (now-row.last_seen).total_seconds()<=65)
+    typing=bool(row and row.typing_to==u.id and row.typing_until and row.typing_until>now)
+    return {'online':online,'typing':typing,'last_seen':row.last_seen.isoformat() if row and row.last_seen else None}
+
+@app.post('/typing/{other_id}')
+def set_typing(other_id:str,d:TypingIn,s:Session=Depends(db),u:User=Depends(auth)):
+    if not s.get(User,other_id): raise HTTPException(404,'Utilisateur introuvable.')
+    row=s.get(Presence,u.id)
+    now=datetime.utcnow()
+    if not row:
+        row=Presence(user_id=u.id,last_seen=now);s.add(row)
+    row.last_seen=now
+    row.typing_to=other_id if d.is_typing else None
+    row.typing_until=(now+timedelta(seconds=8)) if d.is_typing else None
+    s.commit()
+    return {'ok':True}
+
 @app.delete('/contacts/{contact_id}')
 def remove_contact(contact_id:str,s:Session=Depends(db),u:User=Depends(auth)):
     row=s.query(Contact).filter_by(owner_id=u.id,contact_id=contact_id).first()
@@ -163,12 +229,17 @@ def remove_contact(contact_id:str,s:Session=Depends(db),u:User=Depends(auth)):
     s.delete(row);s.commit();return {'ok':True,'removed_from_my_contacts':True}
 @app.post('/messages')
 def send(d:Msg,s:Session=Depends(db),u:User=Depends(auth)):
-    if not is_contact(s,u.id,d.receiver_id): raise HTTPException(403,'Vous devez d’abord être contacts.')
-    m=Message(sender_id=u.id,receiver_id=d.receiver_id,body=d.body);s.add(m);s.commit();s.refresh(m);return message_view(m)
+    receiver=s.get(User,d.receiver_id)
+    if not receiver or receiver.id==u.id: raise HTTPException(404,'Compte destinataire introuvable.')
+    # Un premier message établit automatiquement le lien dans les contacts des deux comptes.
+    if not is_contact(s,u.id,receiver.id): s.add(Contact(owner_id=u.id,contact_id=receiver.id))
+    if not is_contact(s,receiver.id,u.id): s.add(Contact(owner_id=receiver.id,contact_id=u.id))
+    m=Message(sender_id=u.id,receiver_id=receiver.id,body=d.body);s.add(m);s.commit();s.refresh(m);return message_view(m)
 @app.get('/messages/{other_id}')
 def history(other_id:str,s:Session=Depends(db),u:User=Depends(auth),since:str|None=None):
-    if not is_contact(s,u.id,other_id): raise HTTPException(403,'Contact non autorisé.')
+    if not s.get(User,other_id): raise HTTPException(404,'Compte ANISRA introuvable.')
     q=s.query(Message).filter(or_(and_(Message.sender_id==u.id,Message.receiver_id==other_id),and_(Message.sender_id==other_id,Message.receiver_id==u.id)))
+    if not is_contact(s,u.id,other_id) and not q.first(): raise HTTPException(403,'Cette discussion n’est pas disponible.')
     if since:
         try:q=q.filter(Message.created_at>datetime.fromisoformat(since.replace('Z','+00:00')).replace(tzinfo=None))
         except ValueError: raise HTTPException(400,'Date de synchronisation invalide.')
