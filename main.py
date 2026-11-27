@@ -78,12 +78,15 @@ class Login(BaseModel): login:str; password:str
 class Invite(BaseModel): receiver_id:str
 class Msg(BaseModel): receiver_id:str; body:str=Field(min_length=1,max_length=10000)
 class CallIn(BaseModel): receiver_id:str; kind:str='vocal'
-class GroupIn(BaseModel): name:str=Field(min_length=1,max_length=100)
+class GroupIn(BaseModel):
+    name:str=Field(min_length=1,max_length=100)
+    description:Optional[str]=Field(default=None,max_length=1000)
 class GroupMsg(BaseModel): body:str=Field(min_length=1,max_length=10000)
 class Group(Base):
     __tablename__='groups'
     id:Mapped[str]=mapped_column(String,primary_key=True,default=lambda:str(uuid.uuid4()))
     name:Mapped[str]=mapped_column(String(100)); owner_id:Mapped[str]=mapped_column(ForeignKey('users.id'),index=True)
+    description:Mapped[Optional[str]]=mapped_column(Text,nullable=True)
 class GroupMember(Base):
     __tablename__='group_members'
     id:Mapped[str]=mapped_column(String,primary_key=True,default=lambda:str(uuid.uuid4()))
@@ -109,29 +112,38 @@ class Status(Base):
     __tablename__='statuses'
     id:Mapped[str]=mapped_column(String,primary_key=True,default=lambda:str(uuid.uuid4()))
     user_id:Mapped[str]=mapped_column(ForeignKey('users.id'),index=True)
-    body:Mapped[str]=mapped_column(Text)
+    body:Mapped[str]=mapped_column(Text,default='')
+    media_data:Mapped[Optional[str]]=mapped_column(Text,nullable=True)
     created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow,index=True)
     expires_at:Mapped[datetime]=mapped_column(DateTime,index=True)
 class ProfileUpdate(BaseModel):
     display_name:Optional[str]=Field(default=None,min_length=1,max_length=80)
     avatar_data:Optional[str]=Field(default=None,max_length=500000)
 class StatusIn(BaseModel):
-    body:str=Field(min_length=1,max_length=1000)
+    body:str=Field(default='',max_length=1000)
+    media_data:Optional[str]=Field(default=None,max_length=1800000)
     duration_hours:int=Field(default=24,ge=1,le=24)
+class GroupUpdate(BaseModel):
+    name:Optional[str]=Field(default=None,min_length=1,max_length=100)
+    description:Optional[str]=Field(default=None,max_length=1000)
 class TypingIn(BaseModel):
     is_typing:bool=False
 Base.metadata.create_all(engine)
 # Migration légère pour les bases existantes.
 try:
-    if 'avatar_data' not in {c['name'] for c in inspect(engine).get_columns('users')}:
-        with engine.begin() as conn:
+    with engine.begin() as conn:
+        if 'avatar_data' not in {c['name'] for c in inspect(engine).get_columns('users')}:
             conn.execute(sql_text('ALTER TABLE users ADD COLUMN avatar_data TEXT'))
+        if 'media_data' not in {c['name'] for c in inspect(engine).get_columns('statuses')}:
+            conn.execute(sql_text('ALTER TABLE statuses ADD COLUMN media_data TEXT'))
+        if 'description' not in {c['name'] for c in inspect(engine).get_columns('groups')}:
+            conn.execute(sql_text('ALTER TABLE groups ADD COLUMN description TEXT'))
 except Exception as migration_error:
     print('Migration avatar_data:', migration_error)
 
 def view(u): return {'id':u.id,'username':u.username,'display_name':u.display_name,'email':u.email,'phone':u.phone,'avatar_data':getattr(u,'avatar_data',None)}
 def make_token(u):
-    n=datetime.now(timezone.utc); return jwt.encode({'sub':u.id,'iat':n,'exp':n+timedelta(days=30)},SECRET,algorithm='HS256')
+    n=datetime.now(timezone.utc); return jwt.encode({'sub':u.id,'iat':n,'exp':n+timedelta(days=180)},SECRET,algorithm='HS256')
 def auth(token:str=Depends(oauth),s:Session=Depends(db)):
     try: uid=jwt.decode(token,SECRET,algorithms=['HS256']).get('sub')
     except JWTError: raise HTTPException(401,'Session invalide ou expirée.')
@@ -222,7 +234,12 @@ def conversations(s:Session=Depends(db),u:User=Depends(auth)):
         peer=s.get(User,peer_id)
         if not peer: continue
         last=s.query(Message).filter(or_(and_(Message.sender_id==u.id,Message.receiver_id==peer_id),and_(Message.sender_id==peer_id,Message.receiver_id==u.id))).order_by(Message.created_at.desc()).first()
-        result.append({'user':view(peer),'last_message':message_view(last) if last else None})
+        unread=0
+        incoming=s.query(Message).filter_by(sender_id=peer_id,receiver_id=u.id).all()
+        for incoming_message in incoming:
+            receipt=s.get(MessageReceipt,(incoming_message.id,u.id))
+            if not receipt or not receipt.read_at: unread+=1
+        result.append({'user':view(peer),'last_message':message_view(last) if last else None,'unread_count':unread})
     result.sort(key=lambda x:(x['last_message'] or {}).get('created_at',''),reverse=True)
     return result
 
@@ -313,11 +330,13 @@ def clear_conversation(other_id:str,s:Session=Depends(db),u:User=Depends(auth)):
 def list_statuses(s:Session=Depends(db),u:User=Depends(auth)):
     now=datetime.utcnow()
     s.query(Status).filter(Status.expires_at<=now).delete(synchronize_session=False);s.commit()
-    return [{'id':x.id,'user_id':x.user_id,'body':x.body,'created_at':x.created_at.isoformat(),'expires_at':x.expires_at.isoformat(),'user':view(s.get(User,x.user_id))} for x in s.query(Status).order_by(Status.created_at.desc()).limit(300).all()]
+    return [{'id':x.id,'user_id':x.user_id,'body':x.body,'media_data':x.media_data,'created_at':x.created_at.isoformat(),'expires_at':x.expires_at.isoformat(),'user':view(s.get(User,x.user_id))} for x in s.query(Status).order_by(Status.created_at.desc()).limit(300).all()]
 @app.post('/statuses')
 def create_status(d:StatusIn,s:Session=Depends(db),u:User=Depends(auth)):
-    now=datetime.utcnow();x=Status(user_id=u.id,body=d.body,created_at=now,expires_at=now+timedelta(hours=d.duration_hours));s.add(x);s.commit();s.refresh(x)
-    return {'id':x.id,'user_id':u.id,'body':x.body,'created_at':x.created_at.isoformat(),'expires_at':x.expires_at.isoformat(),'user':view(u)}
+    if not d.body.strip() and not d.media_data: raise HTTPException(400,'Ajoutez un texte ou une photo.')
+    if d.media_data and not d.media_data.startswith('data:image/'): raise HTTPException(400,'Photo de statut invalide.')
+    now=datetime.utcnow();x=Status(user_id=u.id,body=d.body,media_data=d.media_data,created_at=now,expires_at=now+timedelta(hours=d.duration_hours));s.add(x);s.commit();s.refresh(x)
+    return {'id':x.id,'user_id':u.id,'body':x.body,'media_data':x.media_data,'created_at':x.created_at.isoformat(),'expires_at':x.expires_at.isoformat(),'user':view(u)}
 @app.delete('/statuses/{sid}')
 def delete_status(sid:str,s:Session=Depends(db),u:User=Depends(auth)):
     x=s.get(Status,sid)
@@ -355,11 +374,18 @@ def download_file(name:str,u:User=Depends(auth)):
     return FileResponse(path,filename=name.split('_',1)[-1],media_type=mimetypes.guess_type(name)[0] or 'application/octet-stream')
 @app.post('/groups')
 def create_group(d:GroupIn,s:Session=Depends(db),u:User=Depends(auth)):
-    g=Group(name=d.name,owner_id=u.id);s.add(g);s.flush();s.add(GroupMember(group_id=g.id,user_id=u.id));s.commit();s.refresh(g);return {'id':g.id,'name':g.name,'owner_id':u.id}
+    g=Group(name=d.name,description=d.description,owner_id=u.id);s.add(g);s.flush();s.add(GroupMember(group_id=g.id,user_id=u.id));s.commit();s.refresh(g);return {'id':g.id,'name':g.name,'description':g.description,'owner_id':u.id}
+@app.patch('/groups/{gid}')
+def update_group(gid:str,d:GroupUpdate,s:Session=Depends(db),u:User=Depends(auth)):
+    g=s.get(Group,gid)
+    if not g or g.owner_id!=u.id: raise HTTPException(403,'Seul un administrateur propriétaire peut modifier ce groupe.')
+    if d.name is not None:g.name=d.name.strip()
+    if d.description is not None:g.description=d.description.strip()
+    s.commit();s.refresh(g);return {'id':g.id,'name':g.name,'description':g.description,'owner_id':g.owner_id}
 @app.get('/groups')
 def list_groups(s:Session=Depends(db),u:User=Depends(auth)):
     ids=[x.group_id for x in s.query(GroupMember).filter_by(user_id=u.id).all()]
-    return [{'id':g.id,'name':g.name,'owner_id':g.owner_id} for g in s.query(Group).filter(Group.id.in_(ids)).all()]
+    return [{'id':g.id,'name':g.name,'description':g.description,'owner_id':g.owner_id} for g in s.query(Group).filter(Group.id.in_(ids)).all()]
 @app.delete('/groups/{gid}/members/me')
 def leave_group(gid:str,s:Session=Depends(db),u:User=Depends(auth)):
     row=s.query(GroupMember).filter_by(group_id=gid,user_id=u.id).first()
